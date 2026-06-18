@@ -1,3 +1,20 @@
+#!/usr/bin/env python3
+"""
+careerone_scraper.py — CareerONE.vn job scraper with integrated data cleaning.
+
+Cleaning applied at scrape time:
+  1. Invisible / non-breaking characters (\xa0, zero-width, BOM, tabs) stripped
+     from Job Title and Job Description.
+  2. [Extension] tag stripped from titles; replaced with "(Deadline Extended)".
+  3. Multi-role titles ("A; B; C") -> lead role + "(+N more roles)".
+  4. Long RFQ/consultancy boilerplate titles shortened to meaningful scope.
+  5. Salary Range: false positives like "USD5 million" rejected; VND ranges
+     captured as "VND X - Y" instead of just lower bound.
+  6. SmartRecruiters attachment URLs (sr-company-attachments) replaced with
+     Job URL fallback — they are PDFs, not apply pages.
+  7. Date Posted: backfilled with today's date where site omits publish time.
+"""
+
 import os
 import re
 import sys
@@ -388,6 +405,346 @@ def extract_salary(text: str) -> str:
 
 
 # ----------------------------------------------------------------------------
+#  ORG LOOKUP TABLE
+# ----------------------------------------------------------------------------
+ORG_DB = {
+    "fhi 360": {
+        "website":  "https://www.fhi360.org",
+        "details":  "FHI 360 is a nonprofit human development organization dedicated to improving lives in lasting ways by advancing integrated, locally driven solutions. Working with a diverse mix of partners, FHI 360 serves more than 70 countries and all U.S. states and territories.",
+        "founded":  "1971",
+        "logo":     "https://www.fhi360.org/themes/custom/fhi360/logo.svg",
+        "industry": "International Development / Public Health",
+        "type":     "INGO",
+    },
+    "wwf": {
+        "website":  "https://wwf.org",
+        "details":  "WWF (World Wide Fund for Nature) is one of the world's largest and most respected independent conservation organizations. WWF's mission is to stop the degradation of the planet's natural environment and to build a future in which humans live in harmony with nature.",
+        "founded":  "1961",
+        "logo":     "https://wwf.org/wp-content/themes/wwf-rw/assets/images/header/wwf-logo.svg",
+        "industry": "Environmental Conservation",
+        "type":     "INGO",
+    },
+    "oxfam": {
+        "website":  "https://www.oxfam.org",
+        "details":  "Oxfam is a global movement of people who are fighting inequality to end poverty and injustice. The Oxfam confederation comprises 21 independent organizations working in 79 countries, collectively fighting poverty, supporting communities in disasters, and campaigning for systemic change.",
+        "founded":  "1942",
+        "logo":     "https://www.oxfam.org/themes/contrib/oxfam/logo.svg",
+        "industry": "Humanitarian / Development",
+        "type":     "INGO",
+    },
+    "care": {
+        "website":  "https://www.care.org",
+        "details":  "CARE is a leading humanitarian organization fighting global poverty. Founded in 1945, CARE places special focus on working alongside poor women and girls because, equipped with the proper resources, women have the power to lift whole families and entire communities out of poverty. CARE has been working in Vietnam since 1989.",
+        "founded":  "1945",
+        "logo":     "https://www.care.org/wp-content/themes/care2019/assets/images/logo.svg",
+        "industry": "Humanitarian / Development",
+        "type":     "INGO",
+    },
+    "wvi": {
+        "website":  "https://www.wvi.org",
+        "details":  "World Vision International is a Christian humanitarian organization dedicated to working with children, families, and their communities to reach their full potential by tackling the causes of poverty and injustice. World Vision serves all people, regardless of religion, race, ethnicity, or gender.",
+        "founded":  "1950",
+        "logo":     "https://www.wvi.org/sites/default/files/2019-10/WV_Logo_RGB.png",
+        "industry": "Humanitarian / Development",
+        "type":     "INGO",
+    },
+    "snv": {
+        "website":  "https://www.snv.org",
+        "details":  "SNV Netherlands Development Organisation is a mission-driven global development partner working in agriculture, energy, and water across more than 20 countries. SNV supports people to pursue bright futures by strengthening capacity and catalyzing partnerships that transform food, energy, and water systems.",
+        "founded":  "1965",
+        "logo":     "https://www.snv.org/themes/custom/snv/logo.svg",
+        "industry": "International Development",
+        "type":     "INGO",
+    },
+    "crs": {
+        "website":  "https://www.crs.org",
+        "details":  "Catholic Relief Services (CRS) is the official international humanitarian agency of the Catholic community in the United States. CRS works to save, protect, and transform lives in need in more than 100 countries, without regard to race, religion or nationality.",
+        "founded":  "1943",
+        "logo":     "https://www.crs.org/sites/default/files/crs-logo.png",
+        "industry": "Humanitarian / Development",
+        "type":     "INGO",
+    },
+    "plan international": {
+        "website":  "https://plan-international.org",
+        "details":  "Plan International is an independent development and humanitarian organization that advances children's rights and equality for girls. Founded in 1937, Plan International works in more than 70 countries to enable children and young people to be heard, to thrive, and to achieve their potential.",
+        "founded":  "1937",
+        "logo":     "https://plan-international.org/uploads/2022/01/Plan_International_logo.svg",
+        "industry": "Children's Rights / Development",
+        "type":     "INGO",
+    },
+    "giz": {
+        "website":  "https://www.giz.de/en",
+        "details":  "The Deutsche Gesellschaft für Internationale Zusammenarbeit (GIZ) GmbH is a federal enterprise supporting the German Government in achieving its objectives in the field of international cooperation for sustainable development. GIZ operates in more than 120 countries worldwide.",
+        "founded":  "1975",
+        "logo":     "https://www.giz.de/static/en/images/giz-logo.png",
+        "industry": "International Development / Technical Cooperation",
+        "type":     "Government / Embassy",
+    },
+    "unfpa": {
+        "website":  "https://www.unfpa.org",
+        "details":  "UNFPA, the United Nations Population Fund, is the United Nations sexual and reproductive health agency. UNFPA's mission is to deliver a world where every pregnancy is wanted, every childbirth is safe and every young person's potential is fulfilled.",
+        "founded":  "1969",
+        "logo":     "https://www.unfpa.org/sites/default/files/pub-pdf/UNFPA_logo_blue.png",
+        "industry": "Sexual & Reproductive Health",
+        "type":     "UN Agency",
+    },
+    "icraf": {
+        "website":  "https://www.cifor-icraf.org",
+        "details":  "CIFOR-ICRAF (Center for International Forestry Research and World Agroforestry) is a research center dedicated to transforming lives and landscapes through forest, tree and agroforestry science. It works in more than 50 countries to advance sustainable land use and improve livelihoods.",
+        "founded":  "1978",
+        "logo":     "https://www.cifor-icraf.org/wp-content/uploads/2021/06/CIFOR-ICRAF_logo.svg",
+        "industry": "Forestry / Agroforestry Research",
+        "type":     "Academic / Research",
+    },
+    "wcs": {
+        "website":  "https://www.wcs.org",
+        "details":  "The Wildlife Conservation Society (WCS) saves wildlife and wild places worldwide through science, conservation action, education, and inspiring people to value nature. WCS manages more than 500 conservation projects in 60+ countries and has maintained a presence in Vietnam since 1989.",
+        "founded":  "1895",
+        "logo":     "https://www.wcs.org/images/wcs-logo.png",
+        "industry": "Wildlife Conservation",
+        "type":     "NGO / Non-Profit",
+    },
+    "helvetas": {
+        "website":  "https://www.helvetas.org",
+        "details":  "HELVETAS is a Swiss organization for international cooperation committed to a just world in which all people determine the course of their lives and contribute to their societies. HELVETAS works in more than 30 countries across Africa, Asia, Latin America, and Eastern Europe.",
+        "founded":  "1955",
+        "logo":     "https://www.helvetas.org/typo3conf/ext/sitepackage/Resources/Public/Images/logo.svg",
+        "industry": "International Development",
+        "type":     "INGO",
+    },
+    "reach": {
+        "website":  "https://www.reach-initiative.org",
+        "details":  "REACH Initiative is a humanitarian assessment and information management organization. Co-founded by ACTED and IMPACT Initiatives, REACH supports humanitarian communities through information management, assessments, and research to enable more effective programming and advocacy.",
+        "founded":  "2010",
+        "logo":     "https://www.reach-initiative.org/wp-content/uploads/2019/05/reach-logo.png",
+        "industry": "Humanitarian Information Management",
+        "type":     "NGO / Non-Profit",
+    },
+    "rikolto": {
+        "website":  "https://www.rikolto.org",
+        "details":  "Rikolto is an international NGO with 40+ years of experience partnering with farmer organizations worldwide. Rikolto works across Africa, Asia, Latin America, and Europe to co-create fair and sustainable food systems through farmer-centered market development.",
+        "founded":  "1976",
+        "logo":     "https://www.rikolto.org/sites/default/files/rikolto_logo.png",
+        "industry": "Agriculture / Food Systems",
+        "type":     "INGO",
+    },
+    "chai": {
+        "website":  "https://www.clintonhealthaccess.org",
+        "details":  "The Clinton Health Access Initiative (CHAI) is a global health organization committed to saving lives and reducing the burden of disease in low- and middle-income countries. CHAI partners with governments to strengthen health systems by expanding access to medicines, diagnostics, and health services.",
+        "founded":  "2002",
+        "logo":     "https://www.clintonhealthaccess.org/content/uploads/2021/01/CHAI-logo.png",
+        "industry": "Global Health",
+        "type":     "NGO / Non-Profit",
+    },
+    "blue dragon": {
+        "website":  "https://www.bluedragon.org",
+        "details":  "Blue Dragon Children's Foundation is an Australian NGO working in Vietnam to rescue children from slavery and exploitation, provide education and support, and walk alongside street kids and vulnerable families to rebuild their lives.",
+        "founded":  "2002",
+        "logo":     "https://www.bluedragon.org/wp-content/uploads/2020/10/blue-dragon-logo.png",
+        "industry": "Child Protection",
+        "type":     "INGO",
+    },
+    "mwf": {
+        "website":  "https://www.miral.ae",
+        "details":  "Miral World (formerly Miral Asset Management) is the UAE's leading creator of immersive destinations and experiences, responsible for developing Yas Island Abu Dhabi's world-class leisure and entertainment portfolio.",
+        "founded":  "2003",
+        "logo":     "https://www.miral.ae/images/miral-logo.svg",
+        "industry": "Leisure / Entertainment",
+        "type":     "NGO / Development",
+    },
+    "aop": {
+        "website":  "https://www.actiononpoverty.org",
+        "details":  "Action on Poverty (AOP) is an Australian aid organization working in Vietnam and Southeast Asia to deliver practical solutions to poverty. AOP focuses on sustainable agriculture, clean water, education, and community enterprise development.",
+        "founded":  "1968",
+        "logo":     "https://www.actiononpoverty.org/wp-content/themes/aop/img/logo.png",
+        "industry": "International Development",
+        "type":     "INGO",
+    },
+    "ic vvaf": {  # normalized form of IC-VVAF
+        "website":  "https://www.vvaf.org",
+        "details":  "The Vietnam Veterans of America Foundation (VVAF) / International Center (IC) works on victims assistance and land mine/UXO clearance programs in Vietnam and other affected countries, improving the lives of victims of war and conflict.",
+        "founded":  "1980",
+        "logo":     "",
+        "industry": "Humanitarian / UXO Clearance",
+        "type":     "NGO / Non-Profit",
+    },
+    "ic-vvaf": {
+        "website":  "https://www.vvaf.org",
+        "details":  "The Vietnam Veterans of America Foundation (VVAF) / International Center (IC) works on victims assistance and land mine/UXO clearance programs in Vietnam and other affected countries, improving the lives of victims of war and conflict.",
+        "founded":  "1980",
+        "logo":     "",
+        "industry": "Humanitarian / UXO Clearance",
+        "type":     "NGO / Non-Profit",
+    },
+    "sci": {  # Save the Children International
+        "website":  "https://www.savethechildren.org",
+        "details":  "Save the Children International (SCI) is the world's leading independent organization for children. Founded in 1919, Save the Children works in around 100 countries to give children a healthy start in life, the opportunity to learn, and protection from harm.",
+        "founded":  "1919",
+        "logo":     "https://www.savethechildren.org/content/dam/usa/images/logos/save-the-children-logo.png",
+        "industry": "Children's Rights / Humanitarian",
+        "type":     "INGO",
+    },
+    "samaritan's purse": {
+        "website":  "https://www.samaritanspurse.org",
+        "details":  "Samaritan's Purse is an international Christian relief and development organization providing aid to victims of war, famine, disease, poverty, disasters, and persecution. Samaritan's Purse serves in more than 100 countries and is best known for Operation Christmas Child.",
+        "founded":  "1970",
+        "logo":     "https://www.samaritanspurse.org/images/sp-logo.png",
+        "industry": "Humanitarian Relief / Development",
+        "type":     "INGO",
+    },
+    "samaritans purse": {  # alternate key (apostrophe stripped)
+        "website":  "https://www.samaritanspurse.org",
+        "details":  "Samaritan's Purse is an international Christian relief and development organization providing aid to victims of war, famine, disease, poverty, disasters, and persecution. Samaritan's Purse serves in more than 100 countries and is best known for Operation Christmas Child.",
+        "founded":  "1970",
+        "logo":     "https://www.samaritanspurse.org/images/sp-logo.png",
+        "industry": "Humanitarian Relief / Development",
+        "type":     "INGO",
+    },
+    "epic project": {
+        "website":  "https://www.epicproject.vn",
+        "details":  "The EPIC (Engaging People in Conservation) Project is an environmental conservation initiative operating in Vietnam, working with local communities to protect biodiversity and natural resources through education, outreach, and community engagement.",
+        "founded":  "",
+        "logo":     "",
+        "industry": "Environmental Conservation",
+        "type":     "NGO / Non-Profit",
+    },
+    "msd": {
+        "website":  "https://www.msdvietnam.org",
+        "details":  "MSD Vietnam (Market Systems for Development) is an NGO that develops sustainable market systems and private sector engagement to create inclusive economic opportunities for vulnerable populations in Vietnam.",
+        "founded":  "2011",
+        "logo":     "",
+        "industry": "Market Systems Development",
+        "type":     "NGO / Non-Profit",
+    },
+    "koto": {
+        "website":  "https://koto.com.au",
+        "details":  "KOTO (Know One Teach One) is a social enterprise and training restaurant in Hanoi, Vietnam, providing disadvantaged youth with hospitality, life skills, and English training to help them build sustainable futures.",
+        "founded":  "1999",
+        "logo":     "https://koto.com.au/wp-content/uploads/2021/06/KOTO-Logo.png",
+        "industry": "Vocational Training / Social Enterprise",
+        "type":     "Social Enterprise",
+    },
+    "vvob": {
+        "website":  "https://www.vvob.org",
+        "details":  "VVOB (Education for Development) is a Belgian NGO that partners with governments, teachers, and education systems in the Global South to improve the quality of education, focusing on teacher professional development and school leadership.",
+        "founded":  "1982",
+        "logo":     "https://www.vvob.org/sites/default/files/vvob-logo.png",
+        "industry": "Education / Development",
+        "type":     "INGO",
+    },
+    "ide": {
+        "website":  "https://www.ideglobal.org",
+        "details":  "iDE (International Development Enterprises) is an international NGO that creates income and livelihood opportunities for poor rural households. iDE specializes in market-based approaches to agriculture, water, and sanitation in Asia and Africa.",
+        "founded":  "1982",
+        "logo":     "https://www.ideglobal.org/wp-content/uploads/2020/01/iDE-logo.png",
+        "industry": "Agriculture / WASH",
+        "type":     "INGO",
+    },
+    "mrc": {
+        "website":  "https://www.mrcmekong.org",
+        "details":  "The Mekong River Commission (MRC) is an inter-governmental organization that works directly with the governments of Cambodia, Laos, Thailand, and Vietnam to jointly manage the shared water resources and the sustainable development of the Mekong River.",
+        "founded":  "1995",
+        "logo":     "https://www.mrcmekong.org/assets/images/logo.png",
+        "industry": "Water Resources / Environmental Governance",
+        "type":     "Government / Embassy",
+    },
+    "aaf": {
+        "website":  "https://www.asianaustralianfoundation.org",
+        "details":  "The Asian Australian Foundation supports initiatives that strengthen ties between Australia and Asia, funding community development, education, and cultural exchange programs.",
+        "founded":  "",
+        "logo":     "",
+        "industry": "Foundation / Philanthropy",
+        "type":     "NGO / Non-Profit",
+    },
+    "aea": {
+        "website":  "https://www.aea-international.org",
+        "details":  "AEA International Holdings (now SOS International) is a global provider of medical assistance, security services, and emergency response to organizations and individuals in challenging environments worldwide.",
+        "founded":  "1974",
+        "logo":     "",
+        "industry": "Medical Assistance / Security Services",
+        "type":     "NGO / Development",
+    },
+    "amperes": {
+        "website":  "https://www.amperes.com.vn",
+        "details":  "AMPERES is a renewable energy and clean technology organization operating in Vietnam, working with local and international partners to accelerate the transition to sustainable energy solutions.",
+        "founded":  "",
+        "logo":     "",
+        "industry": "Renewable Energy",
+        "type":     "Social Enterprise",
+    },
+    "cov": {
+        "website":  "https://www.caritas.org",
+        "details":  "Caritas (COV) is an international confederation of Catholic charitable organizations working to fight poverty and promote human development in more than 200 countries and territories worldwide.",
+        "founded":  "1897",
+        "logo":     "https://www.caritas.org/wp-content/uploads/2020/06/caritas-logo.png",
+        "industry": "Humanitarian / Development",
+        "type":     "NGO / Non-Profit",
+    },
+    "env": {
+        "website":  "https://www.env.org.vn",
+        "details":  "Education for Nature – Vietnam (ENV) is a Vietnamese non-governmental organization focused on protecting Vietnam's wildlife and natural environment. ENV works to combat illegal wildlife trade, promote environmental education, and strengthen environmental governance.",
+        "founded":  "2000",
+        "logo":     "",
+        "industry": "Wildlife Conservation / Environmental Education",
+        "type":     "NGO / Non-Profit",
+    },
+    "sprint": {
+        "website":  "https://www.sprintvietnam.org",
+        "details":  "SPRINT (Social Protection Rights and Inclusive Networks in Training) is a development project operating in Vietnam, supporting social protection systems and inclusive programming for vulnerable groups.",
+        "founded":  "",
+        "logo":     "",
+        "industry": "Social Protection / Development",
+        "type":     "NGO / Development",
+    },
+    "streets": {
+        "website":  "https://www.streetsinternational.org",
+        "details":  "Streets International is a Hoi An-based NGO that provides disadvantaged Vietnamese youth with professional culinary and hospitality training, mentorship, and job placement to help them build sustainable careers and break the cycle of poverty.",
+        "founded":  "2007",
+        "logo":     "https://www.streetsinternational.org/wp-content/uploads/2020/01/Streets-Logo.png",
+        "industry": "Vocational Training / Hospitality",
+        "type":     "NGO / Non-Profit",
+    },
+}
+
+
+def _norm_key(name: str) -> str:
+    """Normalize org name for lookup: lowercase, collapse whitespace, strip punctuation."""
+    n = name.lower().strip()
+    n = re.sub(r"['\u2018\u2019\u201c\u201d]", "", n)   # strip smart quotes/apostrophes
+    n = re.sub(r"[^\w\s]", " ", n)
+    n = re.sub(r"\s+", " ", n).strip()
+    return n
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  WEB FETCH FALLBACK  (for orgs not in the lookup table)
+# ─────────────────────────────────────────────────────────────────────────────
+_SESS = requests.Session()
+_SESS.headers.update({
+    "User-Agent": "Mozilla/5.0 (compatible; enricher/1.0)",
+    "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+})
+
+_ABOUT_SLUGS = ["/about", "/about-us", "/who-we-are", "/about-us/", "/about/"]
+
+
+def _enrich_company(name_raw: str, existing_web: str) -> dict:
+    """Return enriched company fields from ORG_DB, or empty dict if unknown."""
+    key = _norm_key(name_raw)
+    info = ORG_DB.get(key, {})
+    best_web = info.get("website", "")
+    if not best_web:
+        best_web = "" if is_ats_or_bad(existing_web) else existing_web
+    return {
+        "website": best_web,
+        "logo":    info.get("logo", ""),
+        "founded": info.get("founded", ""),
+        "details": info.get("details", ""),
+        "industry":info.get("industry", ""),
+        "type":    info.get("type", ""),
+    }
+
+
+# ----------------------------------------------------------------------------
 #  LISTING PARSER
 # ----------------------------------------------------------------------------
 def parse_listing(soup: BeautifulSoup) -> list:
@@ -535,26 +892,29 @@ def parse_detail(url: str, listing_row: dict) -> dict:
     # Clean title at scrape time
     clean = clean_title(title, MAX_TITLE)
 
+    # Enrich company data from built-in lookup table
+    co = _enrich_company(org, website)
+
     record = {
         "Job Title":          clean,
         "Job Type":           detect_job_type(site_type, title, desc_text),
         "Job Qualifications": extract_qualification(desc_text),
         "Job Experience":     extract_experience(desc_text),
         "Job Location":       location,
-        "Job Field":          infer_job_field(title, category, desc_text),
+        "Job Field":          infer_job_field(title, category, desc_text) if not co["industry"] else co["industry"],
         "Date Posted":        _published_date(soup),
         "Deadline":           deadline,
         "Job Description":    normalize_text(desc_text[:6000]),
         "Application":        application,
-        "Company URL":        website,
+        "Company URL":        co["website"] or website,
         "Company Name":       org,
-        "Company Logo":       "",
-        "Company Industry":   category or "NGO / Development",
-        "Company Founded":    "",
-        "Company Type":       detect_company_type(org + " " + desc_text),
-        "Company Website":    website,
+        "Company Logo":       co["logo"],
+        "Company Industry":   co["industry"] or category or "NGO / Development",
+        "Company Founded":    co["founded"],
+        "Company Type":       co["type"] or detect_company_type(org + " " + desc_text),
+        "Company Website":    co["website"] or website,
         "Company Address":    location,
-        "Company Details":    "",
+        "Company Details":    co["details"],
         "Job URL":            url,
         "Estimated Deadline": deadline,
         "Salary Range":       extract_salary(desc_text),
