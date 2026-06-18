@@ -3,7 +3,7 @@ name: Scraper
 # Runs on a schedule and on demand, then commits refreshed data files.
 on:
   schedule:
-    - cron: "0 1 * * *"      # daily at 01:00 UTC  (08:00 Vietnam time)
+     - cron: '0 */2 * * *'   # runs every 2 hours
   workflow_dispatch:
     inputs:
       max_pages:
