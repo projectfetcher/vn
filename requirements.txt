@@ -1,5 +1,19 @@
-requests>=2.31,<3
-beautifulsoup4>=4.12,<5
-pandas>=2.0,<3
-openpyxl>=3.1,<4
-lxml>=5.0
+# ── Core scraping ─────────────────────────────────────────────────────────
+requests>=2.31.0
+beautifulsoup4>=4.12.3
+lxml>=5.2.1            # faster HTML parser for BeautifulSoup
+
+# ── Data handling ─────────────────────────────────────────────────────────
+pandas>=2.2.2
+openpyxl>=3.1.2        # XLSX read/write
+
+# ── Paraphrasing / NLP ────────────────────────────────────────────────────
+sentence-transformers>=2.7.0   # similarity scoring (all-MiniLM-L6-v2)
+torch>=2.2.0                   # required by sentence-transformers (CPU build)
+
+# ── Grammar correction (optional — remove if API rate-limits are a concern) ──
+language-tool-python>=2.7.1
+
+# ── SSL / misc ────────────────────────────────────────────────────────────
+urllib3>=2.2.1
+certifi>=2024.2.2
