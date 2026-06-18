@@ -34,8 +34,8 @@ BASE        = "https://careerone.vn"
 JOBS_URL    = f"{BASE}/jobs"
 MAX_PAGES   = int(os.environ.get("CO_MAX_PAGES", "6"))    # 0 = until empty
 DELAY       = float(os.environ.get("CO_DELAY", "1.0"))
-#OUTPUT_CSV  = os.environ.get("CO_OUT_CSV",  "careerone_jobs.csv")
-#OUTPUT_XLSX = os.environ.get("CO_OUT_XLSX", "careerone_jobs.xlsx")
+OUTPUT_CSV  = os.environ.get("CO_OUT_CSV",  "careerone_jobs.csv")
+OUTPUT_XLSX = os.environ.get("CO_OUT_XLSX", "careerone_jobs.xlsx")
 TRACKER     = os.environ.get("CO_TRACKER",  "processed_urls.csv")
 MAX_TITLE   = int(os.environ.get("CO_MAX_TITLE", "80"))
 
