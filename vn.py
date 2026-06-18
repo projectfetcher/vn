@@ -1,3 +1,18 @@
+#!/usr/bin/env python3
+"""
+careerone_scraper.py — CareerONE.vn job scraper with integrated data cleaning,
+Mistral paraphrasing, column mapping, and WordPress posting.
+
+Pipeline:
+  1. Crawl listing pages → collect job URLs
+  2. Parse each detail page → structured record
+  3. Map columns → standard schema
+  4. Paraphrase title / description / company via Mistral
+  5. Post to WordPress (WP Job Manager) with logo upload & taxonomy terms
+  6. Track processed jobs in a local CSV tracker
+  7. Save raw scraped data to CSV + XLSX
+"""
+
 import os
 import re
 import sys
@@ -1288,6 +1303,181 @@ def parse_listing(soup: BeautifulSoup) -> list:
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# DESCRIPTION CLEANER  ← NEW: strips all boilerplate from the body text
+# ════════════════════════════════════════════════════════════════════════════
+
+# Lines that signal the start of the application / submission block.
+# Once matched, everything from here to the end is discarded.
+_APPLY_LINE = re.compile(
+    r"^\s*(?:"
+    r"to\s+(?:apply|submit)|"
+    r"(?:please\s+)?send\s+(?:your\s+)?(?:cv|resume|application)|"
+    r"interested\s+candidates\s+(?:should|may|are)|"
+    r"how\s+to\s+apply|"
+    r"application\s+(?:process|instructions?|deadline|submission)|"
+    r"submit\s+(?:your\s+)?(?:application|cv|resume)|"
+    r"(?:please\s+)?(?:email|send)\s+(?:your\s+)?(?:cv|resume|application)|"
+    r"closing\s+date|"
+    r"deadline\s+for\s+(?:applications?|submission)|"
+    r"applications?\s+(?:close|due|deadline)|"
+    r"we\s+kindly\s+request|"
+    r"professional\s+candidates\s+are\s+encouraged\s+to\s+apply|"
+    r"only\s+applications?\s+received|"
+    r"questions\s+due\s+date|"
+    r"responses?\s+to\s+(?:any\s+)?inquir|"
+    r"prepare\s+and\s+submit\s+a\s+(?:competitive\s+)?quotation|"
+    r"please\s+ensure\s+the\s+subject\s+line|"
+    r"we\s+invite\s+qualified\s+candidates|"
+    r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"   # bare email
+    r")",
+    re.IGNORECASE,
+)
+
+# Standalone date lines like "June 22, 2026" or "5 June 26, 2026 at 5:00 PM"
+_DATE_LINE = re.compile(
+    r"^\s*\d{0,2}\s*(?:january|february|march|april|may|june|july|august|"
+    r"september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?"
+    r"(?:,?\s*\d{4})?(?:\s+at\s+[\d:]+\s*(?:AM|PM))?\s*$",
+    re.IGNORECASE,
+)
+
+# Whole-sentence RFQ / procurement boilerplate patterns — stripped anywhere in body.
+_BOILER_SENTENCES = re.compile(
+    r"(?:"
+    # RFQ intro / availability notices
+    r"the\s+request\s+for\s+quotation\s+\(rfq\)[^.]*\."
+    r"|rfq\s+document\s+is\s+(?:now\s+)?available[^.]*\."
+    r"|interested\s+parties\s+must\s+submit[^.]*\."
+    r"|ensure\s+all\s+required\s+documentation[^.]*\."
+    r"|the\s+rfq\s+outlines[^.]*\."
+    r"|reviewing\s+the\s+document\s+thoroughly[^.]*\."
+    # Submission / quotation instructions
+    r"|prepare\s+and\s+submit\s+a\s+competitive\s+quotation[^.]*\."
+    r"|please\s+ensure\s+the\s+subject\s+line[^.]*\."
+    r"|quote-it\s+equipment[^.]*\."
+    # Responses / Q&A schedule lines
+    r"|responses\s+to\s+any\s+inquiries\s+will\s+be\s+published[^.]*\."
+    r"|questions\s+due\s+date[^.]*\."
+    # "Only applications received by…" closers
+    r"|only\s+applications?\s+received\s+by[^.]*\."
+    # Generic "we invite qualified candidates" block
+    r"|we\s+invite\s+qualified\s+candidates\s+to\s+submit[^.]*\."
+    r"|to\s+be\s+eligible[^.]*\."
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Unfilled template placeholders like [insert date], [X years], [specific field]
+_TEMPLATE_PLACEHOLDER = re.compile(
+    r"\[\s*(?:insert\s+\w[\w\s]*|x\s+years?|specific\s+[\w\s]+|degree[^\]]*"
+    r"|certification[^\]]*|industry[^\]]*|field[^\]]*|list\s+key[^\]]*"
+    r"|relevant\s+[\w\s]*|required\s+[\w\s]*|\d+\s+[\w\s]*)\s*\]",
+    re.IGNORECASE,
+)
+
+# Lines consisting ONLY of a placeholder (after stripping)
+_PLACEHOLDER_ONLY_LINE = re.compile(
+    r"^\s*\[[^\]]{1,80}\]\s*$"
+)
+
+# Meaningless fragment lines — link-text debris, lone punctuation, "see attachment" etc.
+_FRAGMENT_LINE = re.compile(
+    r"^\s*(?:"
+    r"[:\-–•·]\s*(?:please\s+see\s+details?\s+in\s+the)?"
+    r"|please\s+see\s+details?\s+in\s+the"
+    r"|see\s+(?:details?|attachment|document|below|above)\s*\.?"
+    r"|[.\-–•·:,;]+\s*"
+    r")\s*$",
+    re.IGNORECASE,
+)
+
+# Sentences whose subject is a filled-in placeholder — e.g. starts with "[…]"
+# or contains only generic boilerplate around a placeholder
+_PLACEHOLDER_SENTENCE = re.compile(
+    r"[^.]*\[\s*(?:insert|x\s+years?|specific|degree|certification|industry|"
+    r"field|list\s+key|relevant|required|\d+\s+\w+)[^\]]*\][^.]*\.",
+    re.IGNORECASE,
+)
+
+# Sentences that are pure procurement/RFQ boilerplate prose (no bracket needed)
+_PROCUREMENT_PROSE = re.compile(
+    r"(?:"
+    r"fhi\s+360\s+is\s+in\s+search\s+of\s+a\s+skilled\s+vendor[^.]*\."
+    r"|we\s+seek\s+candidates\s+with\s+a\s+minimum\s+of\s+five\s+years[^.]*\."
+    r"|proficiency\s+in\s+\[specific\s+software[^\]]*\][^.]*\."
+    r"|the\s+ideal\s+applicant\s+should\s+hold\s+a\s+\[[^\]]*\][^.]*\."
+    r"|excellent\s+communication\s+and\s+teamwork\s+abilities\s+are\s+required[^.]*\."
+    r"|additionally,\s+experience\s+with\s+\[[^\]]*\][^.]*\."
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def clean_description(raw: str) -> str:
+    """
+    Multi-pass pipeline that removes:
+      1. Application / submission block (cutoff on first trigger line)
+      2. Inline email addresses
+      3. Standalone date-only lines
+      4. RFQ / procurement boilerplate sentences (regex)
+      5. Unfilled template placeholders [insert …] etc.
+      6. Sentences that are entirely placeholder or procurement prose
+      7. Leftover blank lines / excess whitespace
+    """
+    if not raw:
+        return raw
+
+    # ── Pass 1: cutoff at first application/submission trigger line ──────
+    kept_lines = []
+    for line in raw.split("\n"):
+        if _APPLY_LINE.match(line) or _DATE_LINE.match(line):
+            break
+        # Also stop if the line contains a bare email address anywhere
+        if re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", line):
+            break
+        kept_lines.append(line)
+    text = "\n".join(kept_lines)
+
+    # ── Pass 2: scrub any stray emails that slipped through ───────────────
+    text = re.sub(
+        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", "", text
+    )
+
+    # ── Pass 3: remove standalone date-only lines (mid-text) ─────────────
+    text = re.sub(
+        r"\n[ \t]*\d{0,2}\s*(?:january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?"
+        r"(?:,?\s*\d{4})?(?:\s+at\s+[\d:]+\s*(?:AM|PM))?[ \t]*\n",
+        "\n", text, flags=re.IGNORECASE,
+    )
+
+    # ── Pass 4: strip RFQ / procurement boilerplate sentences ────────────
+    text = _BOILER_SENTENCES.sub("", text)
+    text = _PROCUREMENT_PROSE.sub("", text)
+
+    # ── Pass 5: strip lines that are ONLY a placeholder or a fragment ────
+    lines = []
+    for line in text.split("\n"):
+        if _PLACEHOLDER_ONLY_LINE.match(line):
+            continue
+        if _FRAGMENT_LINE.match(line):
+            continue
+        lines.append(line)
+    text = "\n".join(lines)
+
+    # ── Pass 6: strip sentences containing unfilled placeholders ─────────
+    text = _PLACEHOLDER_SENTENCE.sub("", text)
+    # Also zap any residual bracket content that didn't form a full sentence
+    text = _TEMPLATE_PLACEHOLDER.sub("", text)
+
+    # ── Pass 7: normalise whitespace ──────────────────────────────────────
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r" *\n *", "\n", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # DETAIL PARSER
 # ════════════════════════════════════════════════════════════════════════════
 DETAIL_LABELS = {
@@ -1367,60 +1557,8 @@ def parse_detail(url: str, listing_row: dict) -> dict:
         desc_text = desc_text.split(title, 1)[-1]
     desc_text = re.split(r"\n\s*Job Details\s*\n", desc_text, maxsplit=1)[0]
 
-    # ── Strip application/contact block from the description ────────────────
-    # Scan line-by-line; stop collecting once we hit a submission/contact line.
-    _APPLY_LINE = re.compile(
-        r"^\s*(?:"
-        r"to\s+(?:apply|submit)|"
-        r"(?:please\s+)?send\s+(?:your\s+)?(?:cv|resume|application)|"
-        r"interested\s+candidates\s+(?:should|may|are)|"
-        r"how\s+to\s+apply|"
-        r"application\s+(?:process|instructions?|deadline|submission)|"
-        r"submit\s+(?:your\s+)?(?:application|cv|resume)|"
-        r"(?:please\s+)?(?:email|send)\s+(?:your\s+)?(?:cv|resume|application)|"
-        r"closing\s+date|"
-        r"deadline\s+for\s+(?:applications?|submission)|"
-        r"applications?\s+(?:close|due|deadline)|"
-        r"we\s+kindly\s+request|"
-        r"professional\s+candidates\s+are\s+encouraged\s+to\s+apply|"
-        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"  # bare email
-        r")",
-        re.IGNORECASE,
-    )
-    _DATE_LINE = re.compile(
-        r"^\s*(?:january|february|march|april|may|june|july|august|"
-        r"september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4}\s*$",
-        re.IGNORECASE,
-    )
-    kept_lines, cutoff_reached = [], False
-    for line in desc_text.split("\n"):
-        if cutoff_reached:
-            break
-        if _APPLY_LINE.match(line) or _DATE_LINE.match(line):
-            cutoff_reached = True
-            break
-        # Also stop if the line contains an email address anywhere
-        if re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", line):
-            break
-        kept_lines.append(line)
-    desc_text = "\n".join(kept_lines)
-
-    # Final safety: scrub any stray emails that still slipped through
-    desc_text = re.sub(
-        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", "", desc_text
-    )
-
-    # Also scrub any stray email addresses that slipped through
-    desc_text = re.sub(
-        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", "", desc_text
-    )
-    # Remove isolated date lines like "July 06th, 2026" or "15th July 2026"
-    desc_text = re.sub(
-        r"\n[ \t]*(?:january|february|march|april|may|june|july|august|"
-        r"september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4}[ \t]*\n",
-        "\n", desc_text, flags=re.IGNORECASE,
-    )
-    desc_text = re.sub(r"\n{2,}", "\n\n", desc_text).strip()
+    # ── Run the full description cleaning pipeline ────────────────────────
+    desc_text = clean_description(desc_text)
 
     emails = extract_cf_emails(soup)
     application = emails[0] if emails else ""
