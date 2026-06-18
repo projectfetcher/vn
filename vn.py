@@ -1366,6 +1366,60 @@ def parse_detail(url: str, listing_row: dict) -> dict:
     if title and title in desc_text:
         desc_text = desc_text.split(title, 1)[-1]
     desc_text = re.split(r"\n\s*Job Details\s*\n", desc_text, maxsplit=1)[0]
+
+    # ── Strip application/contact block from the description ────────────────
+    # Scan line-by-line; stop collecting once we hit a submission/contact line.
+    _APPLY_LINE = re.compile(
+        r"^\s*(?:"
+        r"to\s+(?:apply|submit)|"
+        r"(?:please\s+)?send\s+(?:your\s+)?(?:cv|resume|application)|"
+        r"interested\s+candidates\s+(?:should|may|are)|"
+        r"how\s+to\s+apply|"
+        r"application\s+(?:process|instructions?|deadline|submission)|"
+        r"submit\s+(?:your\s+)?(?:application|cv|resume)|"
+        r"(?:please\s+)?(?:email|send)\s+(?:your\s+)?(?:cv|resume|application)|"
+        r"closing\s+date|"
+        r"deadline\s+for\s+(?:applications?|submission)|"
+        r"applications?\s+(?:close|due|deadline)|"
+        r"we\s+kindly\s+request|"
+        r"professional\s+candidates\s+are\s+encouraged\s+to\s+apply|"
+        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}"  # bare email
+        r")",
+        re.IGNORECASE,
+    )
+    _DATE_LINE = re.compile(
+        r"^\s*(?:january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4}\s*$",
+        re.IGNORECASE,
+    )
+    kept_lines, cutoff_reached = [], False
+    for line in desc_text.split("\n"):
+        if cutoff_reached:
+            break
+        if _APPLY_LINE.match(line) or _DATE_LINE.match(line):
+            cutoff_reached = True
+            break
+        # Also stop if the line contains an email address anywhere
+        if re.search(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", line):
+            break
+        kept_lines.append(line)
+    desc_text = "\n".join(kept_lines)
+
+    # Final safety: scrub any stray emails that still slipped through
+    desc_text = re.sub(
+        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", "", desc_text
+    )
+
+    # Also scrub any stray email addresses that slipped through
+    desc_text = re.sub(
+        r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}", "", desc_text
+    )
+    # Remove isolated date lines like "July 06th, 2026" or "15th July 2026"
+    desc_text = re.sub(
+        r"\n[ \t]*(?:january|february|march|april|may|june|july|august|"
+        r"september|october|november|december)\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4}[ \t]*\n",
+        "\n", desc_text, flags=re.IGNORECASE,
+    )
     desc_text = re.sub(r"\n{2,}", "\n\n", desc_text).strip()
 
     emails = extract_cf_emails(soup)
