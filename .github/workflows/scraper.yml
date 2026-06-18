@@ -1,15 +1,23 @@
 name: Scraper
 
-# Runs on a schedule and on demand, then commits the refreshed data files.
+# Runs on a schedule and on demand, then commits refreshed data files.
 on:
   schedule:
-    - cron: "0 1 * * *"      # daily at 01:00 UTC (08:00 Vietnam time)
+    - cron: "0 1 * * *"      # daily at 01:00 UTC  (08:00 Vietnam time)
   workflow_dispatch:
     inputs:
       max_pages:
         description: "Max listing pages to crawl (0 = until empty)"
         required: false
-        default: "6"
+        default: "0"
+      paraphrase:
+        description: "Enable Mistral paraphrasing (true/false)"
+        required: false
+        default: "true"
+      wp_post:
+        description: "Enable WordPress posting (true/false)"
+        required: false
+        default: "true"
 
 permissions:
   contents: write            # needed to commit the output files back
@@ -17,37 +25,56 @@ permissions:
 jobs:
   scrape:
     runs-on: ubuntu-latest
-   
 
     env:
-      CO_MAX_PAGES: ${{ github.event.inputs.max_pages || '6' }}
-      CO_DELAY: "1.0"
-      CO_OUT_CSV: "careerone_jobs.csv"
-      CO_OUT_XLSX: "careerone_jobs.xlsx"
+      CO_MAX_PAGES: ${{ github.event.inputs.max_pages || '0' }}
+      CO_DELAY:     "1.0"
+      
+      CO_TRACKER:   "processed_urls.csv"
+      CO_IDS_FILE:  "careerone_processed_ids.csv"
+      CO_MAX_TITLE: "80"
+      CO_PARAPHRASE: ${{ github.event.inputs.paraphrase || 'true' }}
+      CO_WP_POST:    ${{ github.event.inputs.wp_post    || 'true' }}
+
+      # ── Secrets (set these in your repo → Settings → Secrets) ──────────
+      MISTRAL_API_KEY: ${{ secrets.MISTRAL_API_KEY }}
+      MISTRAL_MODEL:   "mistral-small-latest"
+      WP_BASE_URL:     ${{ secrets.WP_BASE_URL }}
+      WP_USERNAME:     ${{ secrets.WP_USERNAME }}
+      WP_APP_PASSWORD: ${{ secrets.WP_APP_PASSWORD }}
 
     steps:
+      # ── 1. Checkout ──────────────────────────────────────────────────────
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ── 2. Python ────────────────────────────────────────────────────────
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: "pip"
 
+      # ── 3. Dependencies ──────────────────────────────────────────────────
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # ── 4. Run scraper ───────────────────────────────────────────────────
       - name: Run scraper
         run: python vn.py
 
+      # ── 5. Commit data files ─────────────────────────────────────────────
       - name: Commit & push updated data
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add careerone_jobs.csv careerone_jobs.xlsx processed_urls.csv 2>/dev/null || true
+          git add \
+            
+            processed_urls.csv \
+            careerone_processed_ids.csv \
+            2>/dev/null || true
           if git diff --staged --quiet; then
             echo "No data changes to commit."
           else
@@ -55,11 +82,12 @@ jobs:
             git push
           fi
 
+      # ── 6. Upload artifacts ──────────────────────────────────────────────
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: careerone-jobs
           path: |
-            careerone_jobs.csv
-            careerone_jobs.xlsx
+            
+            careerone_processed_ids.csv
           if-no-files-found: ignore
